@@ -200,3 +200,34 @@ def generate(model, idx, max_new_tokens, temperature=1.0, top_k=50):
 
     return idx
 
+
+
+
+
+
+
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = GPTModel(GPT_CONFIG_774M).to(device)
+model = model.half()
+
+load_hf_weights(model)
+
+model.eval()
+torch.set_grad_enabled(False)
+
+tokenizer = tiktoken.get_encoding("gpt2")
+
+prompt = "who was the first person to walk on the moon?"
+idx = torch.tensor([tokenizer.encode(prompt)], device=device)
+
+out = generate(
+    model,
+    idx,
+    max_new_tokens=40,
+    temperature=0.2,
+    top_k=20
+)
+
+print(tokenizer.decode(out[0].tolist()))
