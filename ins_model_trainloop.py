@@ -301,3 +301,137 @@ class GPTModel(nn.Module):
         x = self.final_norm(x)
         return self.out_head(x)
 
+def load_hf_weights(custom_gpt):
+    hf = GPT2LMHeadModel.from_pretrained("gpt2-medium")
+    sd = hf.state_dict()
+
+    custom_gpt.tok_emb.weight.data.copy_(sd["transformer.wte.weight"])
+    custom_gpt.pos_emb.weight.data.copy_(sd["transformer.wpe.weight"])
+
+    for i, block in enumerate(custom_gpt.trf_blocks):
+        p = f"transformer.h.{i}."
+
+        qkv_w = sd[p + "attn.c_attn.weight"]
+        qkv_b = sd[p + "attn.c_attn.bias"]
+
+        q, k, v = qkv_w.split(custom_gpt.tok_emb.embedding_dim, dim=1)
+        qb, kb, vb = qkv_b.split(custom_gpt.tok_emb.embedding_dim)
+
+        block.att.W_query.weight.data.copy_(q.T)
+        block.att.W_key.weight.data.copy_(k.T)
+        block.att.W_value.weight.data.copy_(v.T)
+
+        block.att.W_query.bias.data.copy_(qb)
+        block.att.W_key.bias.data.copy_(kb)
+        block.att.W_value.bias.data.copy_(vb)
+
+        block.att.out_proj.weight.data.copy_(sd[p + "attn.c_proj.weight"].T)
+        block.att.out_proj.bias.data.copy_(sd[p + "attn.c_proj.bias"])
+
+        block.ff.layers[0].weight.data.copy_(sd[p + "mlp.c_fc.weight"].T)
+        block.ff.layers[0].bias.data.copy_(sd[p + "mlp.c_fc.bias"])
+        block.ff.layers[2].weight.data.copy_(sd[p + "mlp.c_proj.weight"].T)
+        block.ff.layers[2].bias.data.copy_(sd[p + "mlp.c_proj.bias"])
+
+        block.norm1.scale.data.copy_(sd[p + "ln_1.weight"])
+        block.norm1.shift.data.copy_(sd[p + "ln_1.bias"])
+        block.norm2.scale.data.copy_(sd[p + "ln_2.weight"])
+        block.norm2.shift.data.copy_(sd[p + "ln_2.bias"])
+
+    custom_gpt.final_norm.scale.data.copy_(sd["transformer.ln_f.weight"])
+    custom_gpt.final_norm.shift.data.copy_(sd["transformer.ln_f.bias"])
+
+    custom_gpt.out_head.weight.data.copy_(sd["transformer.wte.weight"])
+
+# ===============================
+# TEXT GENERATION
+# ===============================
+@torch.no_grad()
+def generate(model, idx, max_new_tokens, temperature=1.0, top_k=50):
+    for _ in range(max_new_tokens):
+        logits = model(idx)[:, -1, :]
+        logits /= temperature
+
+        if top_k is not None:
+            v, _ = torch.topk(logits, top_k)
+            logits[logits < v[:, [-1]]] = -torch.inf
+
+        probs = torch.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, 1)
+        idx = torch.cat([idx, idx_next], dim=1)
+
+    return idx
+
+# ===============================
+# RUN
+# ===============================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
+
+model = GPTModel(BASE_CONFIG).to(device)
+load_hf_weights(model)
+model.eval()                                                     ###########model loaded with gpt2-medium weights
+
+tokenizer = tiktoken.get_encoding("gpt2")        
+
+
+
+
+def calc_loss_batch(input_batch, target_batch, model, device):
+    input_batch, target_batch = input_batch.to(device), target_batch.to(device)
+    logits = model(input_batch)
+    loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target_batch.flatten())
+    return loss
+
+
+def calc_loss_loader(data_loader, model, device, num_batches=None):
+    total_loss = 0.
+    if len(data_loader) == 0:
+        return float("nan")
+    elif num_batches is None:
+        num_batches = len(data_loader)
+    else:
+      
+        num_batches = min(num_batches, len(data_loader))
+    for i, (input_batch, target_batch) in enumerate(data_loader):
+        if i < num_batches:
+            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            total_loss += loss.item()
+        else:
+            break
+    return total_loss / num_batches
+
+def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
+                       eval_freq, eval_iter, start_context, tokenizer):
+
+    train_losses, val_losses, track_tokens_seen = [], [], []
+    tokens_seen, global_step = 0, -1
+
+                                         #main training loop
+    for epoch in range(num_epochs):
+        model.train()  
+        
+        for input_batch, target_batch in train_loader:
+            optimizer.zero_grad() 
+            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            loss.backward()
+            optimizer.step()
+            tokens_seen += input_batch.numel() 
+            global_step += 1
+
+                                                                  #evaluation step
+            if global_step % eval_freq == 0: 
+                train_loss, val_loss = evaluate_model(
+                    model, train_loader, val_loader, device, eval_iter)
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                track_tokens_seen.append(tokens_seen)
+                print(f"Ep {epoch+1} (Step {global_step:06d}): "
+                      f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
+
+                                #print a sample text after each epoch
+        generate_and_print_sample(
+            model, tokenizer, device, start_context
+        )
+
+    return train_losses, val_losses, track_tokens_seen
